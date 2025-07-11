@@ -313,7 +313,7 @@ class RouteGenerator:
                         try:
                             network = IPv4Network(cidr)
                             ipv4_root.append(NetworkNode(network))
-                            print(f"添加IPv4根网段: {network}")
+                            # print(f"添加IPv4根网段: {network}")
                         except ValueError as e:
                             print(f"警告: IPv4根网段格式错误 {cidr}: {e}")
 
