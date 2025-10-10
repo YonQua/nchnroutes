@@ -2,422 +2,289 @@
 """
 nchnroutes - 生成非中国大陆路由规则
 用于BIRD路由器的OSPF智能分流配置
-
-重构版本特性：
-- 支持外部配置文件
-- 完整的中文注释
-- 更好的代码结构
-- 错误处理和日志
 """
 
 import argparse
 import csv
-import os
-import math
+import logging
 import re
 import configparser
+from pathlib import Path
 from ipaddress import IPv4Network, IPv6Network
-from typing import List, Set
+
+# 配置常量
+class ConfigKeys:
+    """配置文件的节名和键名"""
+    SECTION_PATHS = '路径配置'
+    SECTION_NETWORK = '网络配置'
+    SECTION_RESERVED_V4 = '保留网段IPv4'
+    SECTION_RESERVED_V6 = '保留网段IPv6'
+    SECTION_CUSTOM_EXCLUDE = '自定义排除'
+    KEY_NEXT_HOP = 'default_next_hop'
 
 # 全局常量
-IPV6_UNICAST = IPv6Network('2000::/3')  # 全球单播IPv6地址空间
-DEFAULT_CONFIG_FILE = "config.ini"
+IPV6_UNICAST = IPv6Network('2000::/3')
+DEFAULT_CONFIG_FILE = Path("config.ini")
 
 class NetworkNode:
     """网络节点类，用于构建路由树结构"""
 
-    def __init__(self, cidr):
+    def __init__(self, cidr, parent=None):
         self.cidr = cidr
         self.child = []
         self.dead = False
+        self.parent = parent
 
     def __repr__(self):
         return f"<NetworkNode {self.cidr}>"
 
 
-
 class RouteGenerator:
     """路由生成器类"""
-    
-    def __init__(self, next_hop: str, config_file: str = DEFAULT_CONFIG_FILE, exclude_networks: List[str] = None):
-        self.next_hop = next_hop
+
+    def __init__(self, config_file: str | Path = DEFAULT_CONFIG_FILE):
+        self.config_file = Path(config_file)
+        self.next_hop = None
         self.reserved_ipv4 = set()
         self.reserved_ipv6 = set()
-        self.config_file = config_file
-        self.config = None  # 配置对象
-        self.paths = {}  # 存储路径配置
+        self.config = None
+        self.paths = {}
 
-        # 加载配置和路径
         self._load_config_paths()
         self._load_reserved_networks()
 
-        # 添加命令行指定的排除网段
-        if exclude_networks:
-            self._add_exclude_networks(exclude_networks)
-
     def _load_config_paths(self):
-        """集中加载所有路径配置"""
-        # 设置默认路径
+        """加载路径配置"""
         self.paths = {
-            'ipv4_address_space': 'ipv4-address-space.csv',
-            'routes4_output': 'routes4.conf',
-            'routes6_output': 'routes6.conf',
-            'china_ipv4_file': 'cn_ipv4_list.txt',
-            'china_ipv6_file': 'cn_ipv6_list.txt',
-            'delegated_apnic': 'delegated-apnic-latest'
+            'ipv4_address_space': Path('ipv4-address-space.csv'),
+            'routes4_output': Path('routes4.conf'),
+            'routes6_output': Path('routes6.conf'),
+            'china_ipv4_file': Path('cn_ipv4_list.txt'),
+            'china_ipv6_file': Path('cn_ipv6_list.txt'),
         }
 
-        # 从配置文件覆盖默认值
-        if os.path.exists(self.config_file):
+        if self.config_file.exists():
             try:
                 config = configparser.ConfigParser()
                 config.read(self.config_file, encoding='utf-8')
-                if config.has_section('路径配置'):
+                if config.has_section(ConfigKeys.SECTION_PATHS):
                     for key in self.paths:
-                        if config.has_option('路径配置', key):
-                            self.paths[key] = config.get('路径配置', key)
+                        if config.has_option(ConfigKeys.SECTION_PATHS, key):
+                            self.paths[key] = Path(config.get(ConfigKeys.SECTION_PATHS, key))
             except Exception as e:
-                print(f"警告: 读取路径配置时出错: {e}")
+                logging.warning(f"读取路径配置出错: {e}")
 
     def _load_reserved_networks(self):
-        """从INI配置文件加载保留网段"""
-        config_path = self.config_file
-
-        if not os.path.exists(config_path):
-            print(f"警告: 配置文件 {config_path} 不存在，使用默认保留网段")
+        """加载保留网段和网络配置"""
+        if not self.config_file.exists():
+            logging.error(f"配置文件不存在: {self.config_file}")
             self._load_default_reserved()
             return
 
         try:
             self.config = configparser.ConfigParser()
-            self.config.read(config_path, encoding='utf-8')
+            self.config.read(self.config_file, encoding='utf-8')
 
-
-
-            config = self.config  # 保持向后兼容
+            # 加载网络配置
+            if self.config.has_section(ConfigKeys.SECTION_NETWORK):
+                if self.config.has_option(ConfigKeys.SECTION_NETWORK, ConfigKeys.KEY_NEXT_HOP):
+                    self.next_hop = self.config.get(ConfigKeys.SECTION_NETWORK, ConfigKeys.KEY_NEXT_HOP).strip()
+                    logging.info(f"下一跳: {self.next_hop}")
+                else:
+                    self.next_hop = "eth0"
+                    logging.warning(f"缺少下一跳配置，使用默认: {self.next_hop}")
+            else:
+                self.next_hop = "eth0"
+                logging.warning(f"缺少网络配置段，使用默认下一跳: {self.next_hop}")
 
             # 加载IPv4保留网段
-            if config.has_section('保留网段IPv4'):
-                for key, value in config.items('保留网段IPv4'):
-                    network_str = value.strip()
-                    if network_str:
-                        try:
-                            network = IPv4Network(network_str)
-                            self.reserved_ipv4.add(network)
-                            print(f"加载IPv4保留网段: {network} ({key})")
-                        except ValueError as e:
-                            print(f"警告: IPv4网段格式错误 {key}={network_str}: {e}")
+            self._load_network_section(ConfigKeys.SECTION_RESERVED_V4, IPv4Network, self.reserved_ipv4)
 
             # 加载IPv6保留网段
-            if config.has_section('保留网段IPv6'):
-                for key, value in config.items('保留网段IPv6'):
-                    network_str = value.strip()
-                    if network_str:
-                        try:
-                            network = IPv6Network(network_str)
-                            self.reserved_ipv6.add(network)
-                            print(f"加载IPv6保留网段: {network} ({key})")
-                        except ValueError as e:
-                            print(f"警告: IPv6网段格式错误 {key}={network_str}: {e}")
+            self._load_network_section(ConfigKeys.SECTION_RESERVED_V6, IPv6Network, self.reserved_ipv6)
 
             # 加载自定义排除网段
-            if config.has_section('自定义排除'):
-                for key, value in config.items('自定义排除'):
+            if self.config.has_section(ConfigKeys.SECTION_CUSTOM_EXCLUDE):
+                for key, value in self.config.items(ConfigKeys.SECTION_CUSTOM_EXCLUDE):
                     network_str = value.strip()
                     if network_str:
                         try:
-                            if ':' in network_str:
-                                network = IPv6Network(network_str)
-                                self.reserved_ipv6.add(network)
-                                print(f"加载自定义IPv6排除: {network} ({key})")
-                            else:
-                                network = IPv4Network(network_str)
-                                self.reserved_ipv4.add(network)
-                                print(f"加载自定义IPv4排除: {network} ({key})")
+                            network = IPv6Network(network_str) if ':' in network_str else IPv4Network(network_str)
+                            target_set = self.reserved_ipv6 if ':' in network_str else self.reserved_ipv4
+                            target_set.add(network)
                         except ValueError as e:
-                            print(f"警告: 自定义网段格式错误 {key}={network_str}: {e}")
+                            logging.warning(f"自定义网段格式错误 {key}={network_str}: {e}")
 
-            # 从网络配置中读取下一跳设置（如果命令行使用的是默认值）
-            if config.has_section('网络配置') and config.has_option('网络配置', 'default_next_hop'):
-                config_next_hop = config.get('网络配置', 'default_next_hop').strip()
-                # 检查是否使用了argparse的默认值（通过比较来判断）
-                parser_default = "ens192"  # 与main()函数中argparse的默认值保持一致
-                if config_next_hop and self.next_hop == parser_default:
-                    self.next_hop = config_next_hop
-                    print(f"从配置文件读取下一跳: {self.next_hop}")
+            logging.info(f"配置加载完成: IPv4={len(self.reserved_ipv4)}, IPv6={len(self.reserved_ipv6)}")
 
         except Exception as e:
-            print(f"错误: 无法读取配置文件 {config_path}: {e}")
-            print("使用默认保留网段")
+            logging.error(f"无法读取配置文件: {e}")
             self._load_default_reserved()
-    
+
+    def _load_network_section(self, section_name: str, NetworkClass, target_set: set):
+        """加载指定配置节的网段"""
+        if self.config.has_section(section_name):
+            for key, value in self.config.items(section_name):
+                network_str = value.strip()
+                if network_str:
+                    try:
+                        target_set.add(NetworkClass(network_str))
+                    except ValueError as e:
+                        logging.warning(f"{section_name}格式错误 {key}={network_str}: {e}")
+
     def _load_default_reserved(self):
-        """加载默认的保留网段（备用方案）"""
+        """加载默认保留网段"""
         default_ipv4 = [
             '0.0.0.0/8', '10.0.0.0/8', '127.0.0.0/8', '169.254.0.0/16',
             '172.24.0.0/13', '192.0.0.0/29', '192.168.0.0/16',
             '224.0.0.0/4', '240.0.0.0/4', '100.64.0.0/10'
         ]
-        
         for network_str in default_ipv4:
             self.reserved_ipv4.add(IPv4Network(network_str))
-    
-    def _add_exclude_networks(self, exclude_networks: List[str]):
-        """添加命令行指定的排除网段"""
-        for network_str in exclude_networks:
-            try:
-                if ':' in network_str:
-                    network = IPv6Network(network_str)
-                    self.reserved_ipv6.add(network)
-                else:
-                    network = IPv4Network(network_str)
-                    self.reserved_ipv4.add(network)
-                print(f"添加排除网段: {network}")
-            except ValueError as e:
-                print(f"警告: 排除网段格式错误: {network_str} - {e}")
-    
-    def _dump_bird_routes(self, nodes: List[NetworkNode], output_file):
+
+        if self.next_hop is None:
+            self.next_hop = "eth0"
+            logging.info(f"使用默认下一跳: {self.next_hop}")
+
+    def _dump_bird_routes(self, nodes: list[NetworkNode], output_file):
         """将路由节点写入BIRD配置文件"""
         for node in nodes:
-            if len(node.child) > 0:
+            if node.child:
                 self._dump_bird_routes(node.child, output_file)
             elif not node.dead:
                 output_file.write(f'route {node.cidr} via "{self.next_hop}";\n')
-    
-    def _subtract_networks(self, root_nodes: List[NetworkNode], subtract_networks: Set):
-        """从根节点中减去指定的网段（递归实现）"""
+
+    def _subtract_networks(self, root_nodes: list[NetworkNode], subtract_networks):
+        """从根节点中减去指定的网段"""
         for network_to_subtract in subtract_networks:
             for node in root_nodes:
                 if node.cidr == network_to_subtract:
                     node.dead = True
                     break
-                elif node.cidr.supernet_of(network_to_subtract):
-                    if len(node.child) > 0:
-                        # 如果已有子节点，递归处理子节点
-                        self._subtract_networks(node.child, {network_to_subtract})
+                if node.cidr.supernet_of(network_to_subtract):
+                    if node.child:
+                        self._subtract_networks(node.child, (network_to_subtract,))
                     else:
-                        # 创建子网段，排除要减去的网段
                         node.child = [
-                            NetworkNode(subnet)
+                            NetworkNode(subnet, parent=node)
                             for subnet in node.cidr.address_exclude(network_to_subtract)
                         ]
                     break
-    
+
     def generate_routes(self):
         """生成路由规则文件"""
-        print("开始生成路由规则...")
-        print("使用本地数据文件进行路由生成...")
+        self._generate_routes_for_protocol(ip_version=4)
+        self._generate_routes_for_protocol(ip_version=6)
+        logging.info("✓ 路由规则生成完成")
+        logging.info(f"  - {self.paths['routes4_output']}")
+        logging.info(f"  - {self.paths['routes6_output']}")
 
-        # 生成IPv4路由
-        self._generate_ipv4_routes()
-
-        # 生成IPv6路由
-        self._generate_ipv6_routes()
-
-        print("路由规则生成完成!")
-        print("生成的文件:")
-        print("  - routes4.conf (IPv4路由)")
-        print("  - routes6.conf (IPv6路由)")
-    
-    def _generate_ipv4_routes(self):
-        """生成IPv4路由规则 - 参考原始nchnroutes逻辑"""
-        print("正在生成IPv4路由...")
-
-        # 从IPv4地址空间CSV文件读取分配信息
+    def _get_ipv4_root_nodes(self) -> list[NetworkNode]:
+        """从CSV文件加载IPv4根网段"""
         ipv4_root = []
-
         ipv4_space_file = self.paths['ipv4_address_space']
         try:
             with open(ipv4_space_file, newline='') as f:
-                f.readline()  # 跳过标题行
+                f.readline()
                 reader = csv.reader(f, quoting=csv.QUOTE_MINIMAL)
-
                 for row in reader:
-                    if len(row) >= 6 and (row[5] == "ALLOCATED" or row[5] == "LEGACY"):
+                    if len(row) >= 6 and row[5] in ("ALLOCATED", "LEGACY"):
                         block = row[0]
-                        # 构建CIDR格式: 如 "001/8" -> "1.0.0.0/8"
                         cidr = f"{block[:3].lstrip('0') or '0'}.0.0.0{block[-2:]}"
                         try:
-                            network = IPv4Network(cidr)
-                            ipv4_root.append(NetworkNode(network))
+                            ipv4_root.append(NetworkNode(IPv4Network(cidr)))
                         except ValueError as e:
-                            print(f"警告: IPv4根网段格式错误 {cidr}: {e}")
-
+                            logging.warning(f"IPv4根网段格式错误 {cidr}: {e}")
         except FileNotFoundError:
-            print(f"警告: {ipv4_space_file} 文件不存在，使用默认IPv4地址空间")
-            # 使用默认的IPv4地址空间 (0.0.0.0/0)
-            ipv4_root = [NetworkNode(IPv4Network('0.0.0.0/0'))]
+            logging.warning(f"{ipv4_space_file} 不存在，使用全局地址空间")
+            return [NetworkNode(IPv4Network('0.0.0.0/0'))]
+        return ipv4_root
 
-        print(f"IPv4根网段总数: {len(ipv4_root)}")
-
-        # 关键修复：按正确顺序处理
-        # 1. 先减去中国IP段（最重要）
-        china_ipv4 = self._load_china_networks(ipv4=True)
-        print(f"开始减去 {len(china_ipv4)} 个中国IPv4网段...")
-        self._subtract_networks(ipv4_root, china_ipv4)
-
-        # 2. 再减去保留网段（包含自定义排除）
-        print(f"开始减去 {len(self.reserved_ipv4)} 个保留/排除IPv4网段...")
-        self._subtract_networks(ipv4_root, self.reserved_ipv4)
-
-        # 写入IPv4路由文件
-        routes_file = self.paths['routes4_output']
-        with open(routes_file, 'w') as f:
-            self._dump_bird_routes(ipv4_root, f)
-
-        print(f"IPv4路由生成完成，共处理 {len(ipv4_root)} 个根网段")
-    
-    def _generate_ipv6_routes(self):
-        """生成IPv6路由规则"""
-        print("正在生成IPv6路由...")
-
-        # IPv6使用全球单播地址空间作为起点
-        ipv6_root = [NetworkNode(IPV6_UNICAST)]
-        print(f"IPv6根网段: {IPV6_UNICAST}")
-
-        # 减去中国IPv6段
-        china_ipv6 = self._load_china_networks(ipv4=False)
-        if china_ipv6:
-            print(f"开始减去 {len(china_ipv6)} 个中国IPv6网段...")
-            self._subtract_networks(ipv6_root, china_ipv6)
+    def _generate_routes_for_protocol(self, ip_version: int):
+        """为指定的IP版本生成路由规则"""
+        if ip_version == 4:
+            proto_name = "IPv4"
+            root_nodes = self._get_ipv4_root_nodes()
+            china_networks = self._load_china_networks(ipv4=True)
+            reserved_networks = self.reserved_ipv4
+            output_path = self.paths['routes4_output']
+        elif ip_version == 6:
+            proto_name = "IPv6"
+            root_nodes = [NetworkNode(IPV6_UNICAST)]
+            china_networks = self._load_china_networks(ipv4=False)
+            reserved_networks = self.reserved_ipv6
+            output_path = self.paths['routes6_output']
         else:
-            print("未找到中国IPv6网段，跳过减法操作")
+            raise ValueError("IP版本必须是4或6")
 
-        # 减去保留IPv6段
-        if self.reserved_ipv6:
-            print(f"开始减去 {len(self.reserved_ipv6)} 个保留IPv6网段...")
-            self._subtract_networks(ipv6_root, self.reserved_ipv6)
+        logging.info(f"正在生成{proto_name}路由...")
+        logging.info(f"  根网段: {len(root_nodes)}")
 
-        # 写入IPv6路由文件
-        routes6_file = self.paths['routes6_output']
-        with open(routes6_file, 'w') as f:
-            self._dump_bird_routes(ipv6_root, f)
+        if china_networks:
+            logging.info(f"  减去中国IP: {len(china_networks)} 个")
+            self._subtract_networks(root_nodes, china_networks)
 
-        print("IPv6路由生成完成")
-    
+        if reserved_networks:
+            logging.info(f"  减去保留IP: {len(reserved_networks)} 个")
+            self._subtract_networks(root_nodes, reserved_networks)
 
+        with open(output_path, 'w') as f:
+            self._dump_bird_routes(root_nodes, f)
+        logging.info(f"  ✓ {proto_name}路由已写入")
 
-    def _parse_iwik_format(self, content: str) -> List[str]:
-        """解析iwik.org的MikroTik格式数据，使用正则表达式提高鲁棒性"""
-        networks = []
-        # 匹配 MikroTik 格式：add address=IP/CIDR list=CN
+    def _parse_iwik_format(self, content: str) -> list[str]:
+        """解析iwik.org的MikroTik格式数据"""
         pattern = r'add address=([\d.:a-fA-F/]+)\s+list=CN'
+        return [m.group(1).strip() for m in re.finditer(pattern, content) if m.group(1).strip()]
 
-        for match in re.finditer(pattern, content):
-            network = match.group(1).strip()
-            if network:
-                networks.append(network)
-
-        return networks
-
-    def _load_china_networks(self, ipv4: bool = True) -> Set:
-        """加载中国IP网段 - 支持iwik.org和APNIC数据源"""
+    def _load_china_networks(self, ipv4: bool = True) -> set:
+        """加载中国IP网段"""
         china_networks = set()
+        data_file = self.paths['china_ipv4_file' if ipv4 else 'china_ipv6_file']
+        NetworkClass = IPv4Network if ipv4 else IPv6Network
 
-        print(f"加载中国{'IPv4' if ipv4 else 'IPv6'}网段（简化版）...")
-
-        if ipv4:
-            # 1. 从iwik数据加载IPv4
-            iwik_file = self.paths['china_ipv4_file']
-            iwik_count = 0
-            try:
-                with open(iwik_file, 'r') as f:
-                    content = f.read()
-                network_strings = self._parse_iwik_format(content)
-                for network_str in network_strings:
-                    try:
-                        network = IPv4Network(network_str)
-                        china_networks.add(network)
-                        iwik_count += 1
-                    except ValueError as e:
-                        print(f"警告: iwik IPv4格式错误 {network_str}: {e}")
-                print(f"从iwik数据加载了 {iwik_count} 个IPv4网段")
-            except FileNotFoundError:
-                print(f"警告: {iwik_file} 不存在，请运行 make download")
-            except Exception as e:
-                print(f"警告: 读取iwik IPv4数据出错: {e}")
-
-            # 2. 如果iwik数据不足，尝试APNIC备用数据
-            if iwik_count == 0:
-                print("⚠️  iwik IPv4数据不可用，尝试APNIC备用数据...")
-                apnic_file = self.paths['delegated_apnic']
-                apnic_count = 0
+        try:
+            with open(data_file, 'r') as f:
+                network_strings = self._parse_iwik_format(f.read())
+            for network_str in network_strings:
                 try:
-                    with open(apnic_file, 'r') as f:
-                        for line in f:
-                            if "apnic|CN|ipv4|" in line:
-                                parts = line.split("|")
-                                if len(parts) >= 5:
-                                    try:
-                                        ip_start = parts[3]
-                                        ip_count = int(parts[4])
-                                        prefix_len = 32 - int(math.log2(ip_count))
-                                        cidr = f"{ip_start}/{prefix_len}"
-                                        network = IPv4Network(cidr)
-                                        china_networks.add(network)
-                                        apnic_count += 1
-                                    except (ValueError, OverflowError) as e:
-                                        print(f"警告: APNIC IPv4格式错误 {line.strip()}: {e}")
-                    print(f"从APNIC备用数据加载了 {apnic_count} 个CN IPv4网段")
-                except FileNotFoundError:
-                    print(f"❌ 错误: {apnic_file} 也不存在，请运行 make download")
-                except Exception as e:
-                    print(f"❌ 错误: 读取APNIC数据失败: {e}")
+                    china_networks.add(NetworkClass(network_str))
+                except ValueError:
+                    pass
+            logging.info(f"  中国{'IPv4' if ipv4 else 'IPv6'}: {len(china_networks)} 个")
+        except FileNotFoundError:
+            logging.error(f"文件不存在: {data_file}")
+        except Exception as e:
+            logging.error(f"读取失败: {e}")
 
-                if apnic_count == 0:
-                    print("❌ 错误: 无法从任何数据源加载IPv4数据")
-                    print("请运行: make download")
+        if len(china_networks) < 100:
+            logging.warning(f"网段数量异常少({len(china_networks)})")
 
-        else:  # IPv6
-            # 1. 从iwik数据加载IPv6
-            iwik_file = self.paths['china_ipv6_file']
-            iwik_count = 0
-            try:
-                with open(iwik_file, 'r') as f:
-                    content = f.read()
-                network_strings = self._parse_iwik_format(content)
-                for network_str in network_strings:
-                    try:
-                        network = IPv6Network(network_str)
-                        china_networks.add(network)
-                        iwik_count += 1
-                    except ValueError as e:
-                        print(f"警告: iwik IPv6格式错误 {network_str}: {e}")
-                print(f"从iwik数据加载了 {iwik_count} 个IPv6网段")
-            except FileNotFoundError:
-                print(f"警告: {iwik_file} 不存在，请运行 make download")
-            except Exception as e:
-                print(f"警告: 读取iwik IPv6数据出错: {e}")
-
-            # 2. 如果iwik数据不足，报告错误
-            if iwik_count == 0:
-                print("❌ 错误: 无法加载iwik IPv6数据，请确保已下载 cn_ipv6_list.txt")
-                print("下载命令: make download 或 make cn_ipv6_list.txt")
-
-        print(f"总共加载 {len(china_networks)} 个中国{'IPv4' if ipv4 else 'IPv6'}网段")
         return china_networks
-
 
 
 def main():
     """主函数"""
-    parser = argparse.ArgumentParser(description='生成非中国大陆路由规则，用于BIRD路由器OSPF分流')
-    parser.add_argument('--exclude', metavar='CIDR', type=str, nargs='*',
-                        help='要排除的IPv4/IPv6网段，CIDR格式')
-    parser.add_argument('--next', default="ens192", metavar="INTERFACE_OR_IP",
-                        help='非中国IP的下一跳，通常是隧道接口名或IP地址 (默认: ens192)')
+    # 配置日志
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(message)s'
+    )
+
+    parser = argparse.ArgumentParser(description='生成非中国大陆路由规则')
     parser.add_argument('--config', default=DEFAULT_CONFIG_FILE,
                         help=f'配置文件路径 (默认: {DEFAULT_CONFIG_FILE})')
-
     args = parser.parse_args()
 
-    print("=== nchnroutes 路由生成器 (重构版) ===")
-    print(f"下一跳设置: {args.next}")
-    print(f"配置文件: {args.config}")
+    logging.info("=" * 60)
+    logging.info("  nchnroutes 路由生成器")
+    logging.info("=" * 60)
+    logging.info(f"配置文件: {args.config}\n")
 
-    # 创建路由生成器并生成路由
-    generator = RouteGenerator(args.next, args.config, args.exclude)
+    generator = RouteGenerator(args.config)
     generator.generate_routes()
+
+    logging.info("\n" + "=" * 60)
 
 if __name__ == "__main__":
     main()
