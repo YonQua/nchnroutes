@@ -35,7 +35,10 @@ curl -o ipv4-address-space.csv https://www.iana.org/assignments/ipv4-address-spa
 curl -o cn_ipv4_list.txt https://cdn.leishao.nyc.mn/http://www.iwik.org/ipcountry/mikrotik/CN
 curl -o cn_ipv6_list.txt https://cdn.leishao.nyc.mn/http://www.iwik.org/ipcountry/mikrotik_ipv6/CN
 
-# 2. 运行生成脚本
+# 2. 准备配置文件
+cp config.example.ini config.ini
+
+# 3. 运行生成脚本
 python3 produce.py
 ```
 
@@ -72,8 +75,8 @@ private_c = 192.168.0.0/16
 ```ini
 [自定义排除]
 # 格式：name = IP/CIDR
-my_server = 140.234.45.58/32
-ipv6_server = 2603:245:245::1/128
+my_server = 140.123.45.58/32
+ipv6_server = 2633:145:145::1/128
 ```
 
 ## BIRD 配置指南
