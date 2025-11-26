@@ -75,8 +75,8 @@ private_c = 192.168.0.0/16
 ```ini
 [自定义排除]
 # 格式：name = IP/CIDR
-my_server = 140.123.45.58/32
-ipv6_server = 2633:145:145::1/128
+my_server = 203.0.113.10/32
+ipv6_server = 2001:db8::1/128
 ```
 
 ## BIRD 配置指南
