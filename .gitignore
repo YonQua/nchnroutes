@@ -4,3 +4,5 @@ routes6.conf
 delegated-apnic-latest
 cn_ipv4_list.txt
 cn_ipv6_list.txt
+config.ini
+ipv4-address-space.csv
